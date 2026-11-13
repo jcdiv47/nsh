@@ -1,0 +1,73 @@
+name: Probe Windows runner
+# Temporary: times the Windows checks on the self-hosted Windows runner,
+# twice (the second run warm). Removed once measured.
+on:
+  push:
+    branches: [probe-windows-runner]
+permissions:
+  contents: read
+jobs:
+  survey:
+    runs-on: [public, Windows, X64]
+    timeout-minutes: 300
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      RUST_MIN_STACK: "268435456"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      RUSTUP_TOOLCHAIN: stable
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain (self-hosted)
+        run: |
+          set -x
+          echo "CARGO_HOME=${CARGO_HOME:-unset} RUSTUP_HOME=${RUSTUP_HOME:-unset} HOME=$HOME"
+          rustup toolchain install stable --profile minimal -c clippy 2>&1 | tail -5
+          echo "rustup rc=${PIPESTATUS[0]}"
+          touch /c/rust/cargo/.write-test 2>&1 && echo "C:\\rust\\cargo writable" && rm /c/rust/cargo/.write-test
+          cargo clippy --version
+
+      - name: Cargo
+        uses: ./.github/actions/cargo
+        with:
+          cache: windows
+
+      - name: Survey
+        run: |
+          mkdir -p "$RUNNER_TEMP/tmp"; export TMPDIR="$RUNNER_TEMP/tmp"
+          log="$RUNNER_TEMP/survey"; mkdir -p "$log"
+          step() { # name, dir, command
+            local name=$1 dir=$2; shift 2; local s=$(date +%s)
+            ( cd "$dir" && bash -c "$*" ) > "$log/$name.log" 2>&1; local rc=$?
+            echo "  $name rc=$rc $(( $(date +%s)-s ))s"
+            [ $rc = 0 ] || tail -25 "$log/$name.log" | sed 's/^/    | /'
+          }
+          windows() {
+            step win-clippy . cargo clippy --all-targets -p nsh-platform-windows -p nsh-windows-host -p nsh-windows-app -p nsh-cli -p nsh-dev -p xtask -- -D warnings
+            step win-clippy-min . cargo clippy -p nsh-windows-app --no-default-features --features js -- -D warnings
+            step win-test . cargo test -p nsh-platform-windows -p nsh-windows-host -p nsh-windows-app -p nsh-cli -p nsh-dev -p xtask
+            step win-build-cli . cargo build -p nsh-cli
+          }
+          windows_ui() {
+            step win-ui-counter . ./target/debug/nsh test examples/counter --target windows
+            step win-ui-form . ./target/debug/nsh test examples/gallery/tests/form.test.tsx --target windows
+          }
+          rustapp() {
+            step app-clippy . cargo clippy -p gallery-native --all-targets --locked -- -D warnings
+            step app-test . cargo test -p gallery-native --locked
+          }
+          gpui() {
+            step gpui-clippy crates/gpui cargo clippy --all-targets --features nsh-platform-gpui/dev -- -D warnings
+            step gpui-clippy-min crates/gpui cargo clippy -p nsh-platform-gpui --no-default-features --features js -- -D warnings
+            step gpui-test crates/gpui cargo test
+          }
+          for pass in 1 2; do
+            for job in windows windows_ui rustapp gpui; do
+              [ $pass = 2 ] && [ $job = windows_ui ] && continue
+              s=$(date +%s); echo "== pass $pass $job"; $job; echo "  $job total $(( $(date +%s)-s ))s"
+            done
+          done
